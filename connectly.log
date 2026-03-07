@@ -1,0 +1,5 @@
+2026-03-07 17:25:54,019 - INFO - Post created via factory: 3 (type: text)
+2026-03-07 17:27:07,657 - INFO - Post created via factory: 4 (type: image)
+2026-03-07 17:59:01,961 - INFO - Post 1 liked by user 1
+2026-03-07 18:01:21,921 - INFO - Post 1 unliked by user 1
+2026-03-07 18:02:53,153 - INFO - Comment added to post 1
