@@ -42,4 +42,21 @@ urlpatterns = [
     path('feed/', views.NewsFeedView.as_view(), name='news-feed'),
     
     path('feed/simple/', views.SimpleFeedView.as_view(), name='simple-feed'),
+
+      # ========== NEW RBAC AND PRIVACY ENDPOINTS ==========
+    
+    # Role management endpoints (admin only)
+    path('admin/users/', views.ListUsersView.as_view(), name='list-users'),
+    path('admin/users/<int:user_id>/promote/', views.PromoteToAdminView.as_view(), name='promote-user'),
+    path('admin/users/<int:user_id>/demote/', views.DemoteFromAdminView.as_view(), name='demote-user'),
+    path('admin/users/<int:user_id>/role/', views.UpdateUserRoleView.as_view(), name='update-role'),
+    
+    # User role info (authenticated users)
+    path('user/role/', views.GetUserRoleView.as_view(), name='user-role'),
+    
+    # Privacy endpoints
+    path('posts/<int:pk>/privacy/', views.UpdatePostPrivacyView.as_view(), name='update-privacy'),
+
+    # Cache management
+path('admin/cache/clear/', views.ClearCacheView.as_view(), name='clear-cache'),
 ]

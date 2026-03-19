@@ -2,18 +2,26 @@ from django.core.paginator import Paginator, EmptyPage, PageNotAnInteger
 from django.db.models import Count
 from rest_framework.authentication import TokenAuthentication
 from rest_framework.permissions import IsAuthenticated
-from .permissions import IsPostAuthor
+from .permissions import IsPostAuthor, IsAdminUser, IsOwnerOrAdmin, CanViewPost, IsRegularUser
 import json
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
+from rest_framework.permissions import IsAuthenticated
+from django.db.models import Count, Q
 from .models import User, Post, Comment, Like  # ✅ Added Like
 from .serializers import UserSerializer, PostSerializer, CommentSerializer, LikeSerializer  # ✅ Added LikeSerializer
+from .permissions import IsAdminUser, IsOwnerOrAdmin, CanViewPost, IsRegularUser
 from factories.post_factory import PostFactory
 from singletons.logger_singleton import LoggerSingleton
 from singletons.config_manager import ConfigManager
+from django.core.cache import cache
+import hashlib
+import json
+from django.db.models import Prefetch
+from django.db import models
 
 logger = LoggerSingleton().get_logger()
 
@@ -110,9 +118,17 @@ class PostListCreate(APIView):
         return Response(serializer.data)
 
     def post(self, request):
-        serializer = PostSerializer(data=request.data)
+        # Make a copy of the data
+        data = request.data.copy()
+        
+        # If privacy is not provided, default to 'public'
+        if 'privacy' not in data:
+            data['privacy'] = 'public'
+        
+        serializer = PostSerializer(data=data)
         if serializer.is_valid():
             serializer.save()
+            logger.info(f"Post created by user {data.get('author')} with privacy: {data.get('privacy')}")
             return Response(serializer.data, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
@@ -137,15 +153,141 @@ class ProtectedView(APIView):
         return Response({"message": "Authenticated!", "user": request.user.username})
 
 class PostDetailView(APIView):
-    permission_classes = [IsAuthenticated, IsPostAuthor]
-
+    """
+    Retrieve, update or delete a post with optimized queries
+    """
+    permission_classes = [IsAuthenticated]
+    
     def get(self, request, pk):
         try:
-            post = Post.objects.get(pk=pk)
-            self.check_object_permissions(request, post)
-            return Response({"content": post.content, "author": post.author.username})
+            # Try to get from cache first
+            cache_key = f"post_detail_{pk}_{request.user.id}"
+            cached_response = cache.get(cache_key)
+            if cached_response:
+                logger.info(f"Cache HIT for post {pk}")
+                return Response(cached_response)
+            
+            logger.info(f"Cache MISS for post {pk}")
+            
+            # Optimized query with related data - THIS IS THE KEY OPTIMIZATION!
+            post = Post.objects.select_related('author').prefetch_related(
+                Prefetch('likes', queryset=Like.objects.select_related('user')),
+                Prefetch('comments', queryset=Comment.objects.select_related('author').order_by('-created_at')[:10])
+            ).get(pk=pk)
+            
+            # Check if user can view this post
+            if not post.can_view(request.user):
+                logger.warning(f"User {request.user.id} attempted to view private post {pk}")
+                return Response(
+                    {'error': 'You do not have permission to view this post'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+            
+            # Serialize the data
+            serializer = PostSerializer(post)
+            response_data = serializer.data
+            
+            # Add cache hit/miss indicator for testing
+            response_data['cached'] = False
+            
+            # Store in cache for 1 minute
+            cache.set(cache_key, response_data, timeout=60)
+            
+            return Response(response_data)
+            
         except Post.DoesNotExist:
-            return Response({"error": "Post not found"}, status=404)
+            return Response({"error": "Post not found"}, status=status.HTTP_404_NOT_FOUND)
+    
+    def put(self, request, pk):
+        # Update method - no caching needed
+        try:
+            post = Post.objects.get(pk=pk)
+            
+            # Check if user can edit this post
+            if not post.can_edit(request.user):
+                logger.warning(f"User {request.user.id} attempted to edit post {pk} without permission")
+                return Response(
+                    {'error': 'You do not have permission to edit this post'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+            
+            serializer = PostSerializer(post, data=request.data, partial=True)
+            if serializer.is_valid():
+                serializer.save()
+                
+                # Clear cache for this post since it was updated
+                cache_key = f"post_detail_{pk}_{request.user.id}"
+                cache.delete(cache_key)
+                logger.info(f"Cache cleared for post {pk} after update")
+                
+                return Response(serializer.data)
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+            
+        except Post.DoesNotExist:
+            return Response({"error": "Post not found"}, status=status.HTTP_404_NOT_FOUND)
+    
+    def delete(self, request, pk):
+        try:
+            post = Post.objects.get(pk=pk)
+            
+            # Check if user can delete this post
+            if not post.can_delete(request.user):
+                logger.warning(f"User {request.user.id} attempted to delete post {pk} without permission")
+                return Response(
+                    {'error': 'You do not have permission to delete this post'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+            
+            # Clear cache before deleting
+            cache_key = f"post_detail_{pk}_{request.user.id}"
+            cache.delete(cache_key)
+            
+            post.delete()
+            logger.info(f"Post {pk} deleted by user {request.user.id}")
+            return Response({"message": "Post deleted successfully"}, status=status.HTTP_200_OK)
+            
+        except Post.DoesNotExist:
+            return Response({"error": "Post not found"}, status=status.HTTP_404_NOT_FOUND)
+        
+class UpdatePostPrivacyView(APIView):
+    """
+    Update privacy setting of a post (owner or admin only)
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def post(self, request, pk):
+        try:
+            post = Post.objects.get(pk=pk)
+            
+            # Only author or admin can change privacy
+            if not post.can_edit(request.user):
+                return Response(
+                    {'error': 'You do not have permission to change privacy settings'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+            
+            privacy = request.data.get('privacy')
+            if privacy not in ['public', 'private']:
+                return Response(
+                    {'error': 'Privacy must be either "public" or "private"'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            old_privacy = post.privacy
+            post.privacy = privacy
+            post.save()
+            
+            logger.info(f"Post {pk} privacy changed from {old_privacy} to {privacy} by user {request.user.id}")
+            
+            return Response({
+                'message': f'Post privacy updated to {privacy}',
+                'post_id': post.id,
+                'privacy': post.privacy,
+                'author': post.author.username
+            })
+            
+        except Post.DoesNotExist:
+            return Response({"error": "Post not found"}, status=status.HTTP_404_NOT_FOUND)
     
 class CreatePostWithFactoryView(APIView):
     def post(self, request):
@@ -349,32 +491,60 @@ def test_google_token(request):
 
 class NewsFeedView(APIView):
     """
-    Get news feed with pagination and sorting
+    Optimized news feed with pagination, caching, and query optimization
     """
     def get(self, request):
         try:
-            # Get query parameters with defaults
-            page = request.GET.get('page', 1)
-            page_size = request.GET.get('page_size', 10)
-            sort_by = request.GET.get('sort', '-created_at')  # Default: newest first
-            feed_type = request.GET.get('type', 'all')  # all, following, popular
+            # Get query parameters
+            page = int(request.GET.get('page', 1))
+            page_size = int(request.GET.get('page_size', 10))
+            feed_type = request.GET.get('type', 'all')
             
-            # Base queryset
+            # Create a cache key based on request parameters
+            cache_key = self._generate_cache_key(request)
+            
+            # Try to get from cache
+            cached_response = cache.get(cache_key)
+            if cached_response:
+                logger.info(f"Cache HIT for feed: {cache_key}")
+                return Response(cached_response)
+            
+            logger.info(f"Cache MISS for feed: {cache_key}")
+            
+            # Start with base queryset
+            queryset = Post.objects.all()
+            
+            # Apply privacy filtering
+            if request.user.is_authenticated:
+                if hasattr(request.user, 'is_admin') and request.user.is_admin():
+                    pass  # Admins see everything
+                else:
+                    queryset = queryset.filter(
+                        models.Q(privacy='public') | 
+                        models.Q(author__username=request.user.username)
+                    )
+            else:
+                queryset = queryset.filter(privacy='public')
+            
+            # Apply feed type
             if feed_type == 'popular':
-                # Sort by like count
-                queryset = Post.objects.annotate(
+                queryset = queryset.annotate(
                     like_count=Count('likes')
                 ).order_by('-like_count', '-created_at')
-            elif feed_type == 'following' and request.user.is_authenticated:
-                # Posts from users the current user follows
-                # You'll need a Follow model for this - optional
-                queryset = Post.objects.all().order_by(sort_by)
+            elif feed_type == 'my_posts' and request.user.is_authenticated:
+                queryset = queryset.filter(author__username=request.user.username).order_by('-created_at')
             else:
-                # Default: all posts sorted by date
-                queryset = Post.objects.all().order_by(sort_by)
+                queryset = queryset.order_by('-created_at')
             
-            # Optimize with select_related and prefetch_related
+            # Optimize queries
             queryset = queryset.select_related('author').prefetch_related('likes', 'comments')
+            
+            # Get total count (cached separately)
+            count_cache_key = f"feed_count_{feed_type}_{request.user.id if request.user.is_authenticated else 'anon'}"
+            total_count = cache.get(count_cache_key)
+            if total_count is None:
+                total_count = queryset.count()
+                cache.set(count_cache_key, total_count, timeout=600)  # 10 minutes
             
             # Pagination
             paginator = Paginator(queryset, page_size)
@@ -391,26 +561,30 @@ class NewsFeedView(APIView):
             for post in posts_page:
                 posts_data.append({
                     'id': post.id,
-                    'content': post.content,
+                    'content': post.content[:200] + '...' if len(post.content) > 200 else post.content,
                     'author': {
                         'id': post.author.id,
-                        'username': post.author.username
+                        'username': post.author.username,
+                        'role': getattr(post.author, 'role', 'user')
                     },
                     'created_at': post.created_at,
+                    'privacy': getattr(post, 'privacy', 'public'),
                     'like_count': post.likes.count(),
                     'comment_count': post.comments.count(),
-                    'post_type': getattr(post, 'post_type', 'text'),
+                    'is_owner': request.user.is_authenticated and post.author.username == request.user.username
                 })
             
-            # Build paginated response
+            # Build response
             response_data = {
-                'count': paginator.count,
+                'count': total_count,
                 'total_pages': paginator.num_pages,
                 'current_page': posts_page.number,
                 'page_size': page_size,
                 'has_next': posts_page.has_next(),
                 'has_previous': posts_page.has_previous(),
-                'results': posts_data
+                'feed_type': feed_type,
+                'results': posts_data,
+                'cached': False
             }
             
             if posts_page.has_next():
@@ -418,46 +592,264 @@ class NewsFeedView(APIView):
             if posts_page.has_previous():
                 response_data['previous_page'] = posts_page.previous_page_number()
             
-            return Response(response_data, status=status.HTTP_200_OK)
+            # Store in cache for 5 minutes
+            cache.set(cache_key, response_data, timeout=300)
+            
+            return Response(response_data)
             
         except Exception as e:
-            return Response(
-                {'error': str(e)},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+            logger.error(f"Error in feed: {str(e)}")
+            return Response({'error': str(e)}, status=500)
+    
+    def _generate_cache_key(self, request):
+        """Generate unique cache key based on request parameters"""
+        key_data = f"feed_{request.GET.urlencode()}_{request.user.id if request.user.is_authenticated else 'anon'}"
+        return f"feed_{hashlib.md5(key_data.encode()).hexdigest()}"
 
 class SimpleFeedView(APIView):
     """
-    Simple news feed with basic pagination
+    Simple news feed with basic pagination and privacy filtering
     """
     def get(self, request):
-        # Get page and page_size from query params
-        page = int(request.GET.get('page', 1))
-        page_size = int(request.GET.get('page_size', 10))
+        try:
+            # Get page and page_size from query params
+            page = int(request.GET.get('page', 1))
+            page_size = int(request.GET.get('page_size', 10))
+            
+            # Apply privacy filtering
+            if request.user.is_authenticated:
+                if request.user.is_admin():
+                    # Admins see everything
+                    posts = Post.objects.all().order_by('-created_at')
+                else:
+                    # Regular users: public posts + their own private posts
+                    posts = Post.objects.filter(
+                        models.Q(privacy='public') | 
+                        models.Q(author=request.user)
+                    ).order_by('-created_at')
+            else:
+                # Anonymous users: only public posts
+                posts = Post.objects.filter(privacy='public').order_by('-created_at')
+            
+            # Paginate
+            paginator = Paginator(posts, page_size)
+            
+            try:
+                posts_page = paginator.page(page)
+            except EmptyPage:
+                return Response(
+                    {'error': 'Page not found'},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+            
+            # Serialize
+            serializer = PostSerializer(posts_page, many=True)
+            
+            # Return paginated response
+            return Response({
+                'count': paginator.count,
+                'total_pages': paginator.num_pages,
+                'current_page': page,
+                'next': posts_page.has_next(),
+                'previous': posts_page.has_previous(),
+                'results': serializer.data
+            })
+            
+        except Exception as e:
+            return Response({'error': str(e)}, status=500)
+    
+# ========== ROLE MANAGEMENT VIEWS ==========
+
+class PromoteToAdminView(APIView):
+    """
+    Promote a user to admin (admin only)
+    """
+    permission_classes = [IsAdminUser]
+    
+    def post(self, request, user_id):
+        try:
+            user = User.objects.get(id=user_id)
+            
+            # Check if already admin
+            if user.is_admin():
+                return Response(
+                    {'error': f'User {user.username} is already an admin'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            user.role = 'admin'
+            user.save()
+            logger.info(f"User {user_id} promoted to admin by {request.user.id}")
+            
+            return Response({
+                'message': f'User {user.username} promoted to admin successfully',
+                'user': {
+                    'id': user.id,
+                    'username': user.username,
+                    'email': user.email,
+                    'role': user.role
+                }
+            }, status=status.HTTP_200_OK)
+            
+        except User.DoesNotExist:
+            return Response(
+                {'error': 'User not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+
+class DemoteFromAdminView(APIView):
+    """
+    Demote an admin to regular user (admin only)
+    """
+    permission_classes = [IsAdminUser]
+    
+    def post(self, request, user_id):
+        try:
+            user = User.objects.get(id=user_id)
+            
+            # Check if user is admin
+            if not user.is_admin():
+                return Response(
+                    {'error': f'User {user.username} is not an admin'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Prevent demoting yourself
+            if user.id == request.user.id:
+                return Response(
+                    {'error': 'You cannot demote yourself'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            user.role = 'user'
+            user.save()
+            logger.info(f"User {user_id} demoted to user by {request.user.id}")
+            
+            return Response({
+                'message': f'User {user.username} demoted to regular user',
+                'user': {
+                    'id': user.id,
+                    'username': user.username,
+                    'email': user.email,
+                    'role': user.role
+                }
+            }, status=status.HTTP_200_OK)
+            
+        except User.DoesNotExist:
+            return Response(
+                {'error': 'User not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+
+class ListUsersView(APIView):
+    """
+    List all users with their roles (admin only)
+    """
+    permission_classes = [IsAdminUser]
+    
+    def get(self, request):
+        # Use the custom User model directly
+        from .models import User as CustomUser
         
-        # Get all posts ordered by date (newest first)
-        posts = Post.objects.all().order_by('-created_at')
+        users = CustomUser.objects.all().values(
+            'id', 'username', 'email', 'role', 'created_at'
+        ).order_by('-created_at')
         
-        # Paginate
-        paginator = Paginator(posts, page_size)
+        return Response({
+            'count': users.count(),
+            'users': list(users)
+        })
+
+
+class GetUserRoleView(APIView):
+    """
+    Get current user's role information
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def get(self, request):
+        # Get the custom user from posts.models using the username
+        from .models import User as CustomUser
         
         try:
-            posts_page = paginator.page(page)
-        except EmptyPage:
+            custom_user = CustomUser.objects.get(username=request.user.username)
+            return Response({
+                'id': custom_user.id,
+                'username': custom_user.username,
+                'email': custom_user.email,
+                'role': custom_user.role,
+                'is_admin': custom_user.is_admin(),
+                'is_regular_user': custom_user.role == 'user',
+                'created_at': custom_user.created_at
+            })
+        except CustomUser.DoesNotExist:
+            return Response({
+                'error': 'User profile not found',
+                'username': request.user.username
+            }, status=404)
+
+
+class UpdateUserRoleView(APIView):
+    """
+    Update a user's role directly (admin only)
+    """
+    permission_classes = [IsAdminUser]
+    
+    def post(self, request, user_id):
+        try:
+            user = User.objects.get(id=user_id)
+            new_role = request.data.get('role')
+            
+            if new_role not in ['admin', 'user', 'guest']:
+                return Response(
+                    {'error': 'Role must be one of: admin, user, guest'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Prevent changing your own role (to avoid losing admin access)
+            if user.id == request.user.id and new_role != 'admin':
+                return Response(
+                    {'error': 'You cannot remove your own admin privileges'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            old_role = user.role
+            user.role = new_role
+            user.save()
+            
+            logger.info(f"User {user_id} role changed from {old_role} to {new_role} by {request.user.id}")
+            
+            return Response({
+                'message': f'User {user.username} role updated from {old_role} to {new_role}',
+                'user': {
+                    'id': user.id,
+                    'username': user.username,
+                    'role': user.role
+                }
+            })
+            
+        except User.DoesNotExist:
             return Response(
-                {'error': 'Page not found'},
+                {'error': 'User not found'},
                 status=status.HTTP_404_NOT_FOUND
             )
         
-        # Serialize
-        serializer = PostSerializer(posts_page, many=True)
-        
-        # Return paginated response
-        return Response({
-            'count': paginator.count,
-            'total_pages': paginator.num_pages,
-            'current_page': page,
-            'next': posts_page.has_next(),
-            'previous': posts_page.has_previous(),
-            'results': serializer.data
-        })
+class ClearCacheView(APIView):
+    """
+    Clear all cache (admin only)
+    """
+    permission_classes = [IsAdminUser]
+    
+    def post(self, request):
+        try:
+            cache.clear()
+            logger.info(f"Cache cleared by user {request.user.username}")
+            return Response({
+                'message': 'Cache cleared successfully',
+                'cleared_by': request.user.username
+            })
+        except Exception as e:
+            logger.error(f"Error clearing cache: {str(e)}")
+            return Response({'error': str(e)}, status=500)
