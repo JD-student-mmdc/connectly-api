@@ -58,5 +58,11 @@ urlpatterns = [
     path('posts/<int:pk>/privacy/', views.UpdatePostPrivacyView.as_view(), name='update-privacy'),
 
     # Cache management
-path('admin/cache/clear/', views.ClearCacheView.as_view(), name='clear-cache'),
+    path('admin/cache/clear/', views.ClearCacheView.as_view(), name='clear-cache'),
+
+    path('profile/<int:user_id>/tasks/', views.UserProfileWithTasks.as_view(), name='user-tasks'),
+
+    path('share-task/', views.ShareTaskAsPost.as_view(), name='share-task'),
+
+    path('assign-task/', views.AssignTaskToFollower.as_view(), name='assign-task'),
 ]

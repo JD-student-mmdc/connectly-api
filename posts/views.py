@@ -22,6 +22,8 @@ import hashlib
 import json
 from django.db.models import Prefetch
 from django.db import models
+from .task_service import get_user_tasks, get_one_task, create_task_in_api
+from .models import Follow
 
 logger = LoggerSingleton().get_logger()
 
@@ -171,9 +173,9 @@ class PostDetailView(APIView):
             
             # Optimized query with related data - THIS IS THE KEY OPTIMIZATION!
             post = Post.objects.select_related('author').prefetch_related(
-                Prefetch('likes', queryset=Like.objects.select_related('user')),
-                Prefetch('comments', queryset=Comment.objects.select_related('author').order_by('-created_at')[:10])
-            ).get(pk=pk)
+    Prefetch('likes', queryset=Like.objects.select_related('user')),
+    Prefetch('comments', queryset=Comment.objects.select_related('author').order_by('-created_at'))
+).get(pk=pk)
             
             # Check if user can view this post
             if not post.can_view(request.user):
@@ -853,3 +855,70 @@ class ClearCacheView(APIView):
         except Exception as e:
             logger.error(f"Error clearing cache: {str(e)}")
             return Response({'error': str(e)}, status=500)
+
+class UserProfileWithTasks(APIView):
+    def get(self, request, user_id):
+        try:
+            user = User.objects.get(id=user_id)
+            tasks = get_user_tasks(user_id)
+            
+            return Response({
+                'id': user.id,
+                'username': user.username,
+                'email': user.email,
+                'tasks': tasks
+            })
+        except User.DoesNotExist:
+            return Response({'error': 'User not found'}, status=404)
+
+class ShareTaskAsPost(APIView):
+    def post(self, request):
+        task_id = request.data.get('task_id')
+        user_id = request.data.get('user_id')
+        
+        if not task_id or not user_id:
+            return Response({'error': 'task_id and user_id required'}, status=400)
+        
+        task = get_one_task(task_id)
+        if not task:
+            return Response({'error': 'Task not found'}, status=404)
+        
+        try:
+            user = User.objects.get(id=user_id)
+            content = f"Task: {task['title']}\n{task['description']}\nStatus: {task['status']}"
+            post = Post.objects.create(content=content, author=user)
+            
+            return Response({
+                'message': 'Task shared as post',
+                'post_id': post.id,
+                'post_content': post.content
+            }, status=201)
+        except User.DoesNotExist:
+            return Response({'error': 'User not found'}, status=404)
+
+class AssignTaskToFollower(APIView):
+    def post(self, request):
+        user_id = request.data.get('user_id')
+        follower_id = request.data.get('follower_id')
+        title = request.data.get('title')
+        description = request.data.get('description', '')
+        
+        if not user_id or not follower_id or not title:
+            return Response({'error': 'user_id, follower_id, and title required'}, status=400)
+        
+        # Check if follower actually follows the user
+        is_follower = Follow.objects.filter(follower_id=follower_id, following_id=user_id).exists()
+        
+        if not is_follower:
+            return Response({'error': 'This user does not follow you'}, status=400)
+        
+        # Create task for the follower
+        task = create_task_in_api(title, description, follower_id)
+        
+        if task:
+            return Response({
+                'message': 'Task assigned to follower',
+                'task': task
+            }, status=201)
+        else:
+            return Response({'error': 'Failed to create task'}, status=500)
